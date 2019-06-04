@@ -32,17 +32,20 @@ class MyDialog(wx.Panel):
         #self.figure = plt.figure(facecolor='gray')
         self.figure = Figure(facecolor='gray')
 
-        # Create an axes, turn off the labels and add them to the figure
-        self.axes = plt.Axes(self.figure,[0,0,1,1])      
-        self.axes.set_axis_off() 
+        # 显示当前图片原图
+        self.axes = plt.Axes(self.figure,[0,0.1,1,1])  #left, bottom,   
+        #self.axes_h = plt.Axes(self.figure,[0,0,1,1]) 
+        self.axes.set_axis_off()
         self.figure.add_axes(self.axes)
+        
         
         # Add the figure to the wxFigureCanvas
         self.canvas = FigureCanvas(self, -1, self.figure)
+
         
         # Add Button and Progress Bar
         self.openBtn=wx.Button(self,-1,"Open",pos=(680,50),size=(70,40))
-        self.saveBtn=wx.Button(self,-1,"Save",pos=(680,150),size=(70,40))
+        self.maskBtn=wx.Button(self,-1,"mask",pos=(680,150),size=(70,40))
         self.frontBtn=wx.Button(self,-1,"Front",pos=(680,200),size=(70,40))
         self.nextBtn=wx.Button(self,-1,"Next",pos=(790,200),size=(70,40))
         self.gauge=wx.Gauge(self,-1,100,(0,520),(640,50))   
@@ -51,7 +54,7 @@ class MyDialog(wx.Panel):
         
         # Attach button with function
         self.Bind(wx.EVT_BUTTON,self.load,self.openBtn)
-        self.Bind(wx.EVT_BUTTON,self.save,self.saveBtn)
+        self.Bind(wx.EVT_BUTTON,self.get_mask,self.maskBtn)
         self.Bind(wx.EVT_BUTTON,self.front,self.frontBtn)
         self.Bind(wx.EVT_BUTTON,self.next,self.nextBtn)
         self.Bind(wx.EVT_BUTTON,self.cvt2HSV,self.Btn_cvt2HSV)
@@ -107,14 +110,85 @@ class MyDialog(wx.Panel):
 
 
 
-        
+    # 使得允许读中文路径 
     def cv2_imread(self, path):
         img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), -1)
         return img
     
+    # 校正斜杠
     def rected_path(self, path):
         return path.replace("\\", "/")
     
+    # 显示img的分量直方图
+    def show_hist(self, img, show=True):
+        plt.clf()
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hist_h = cv2.calcHist([hsv], [0], None, [180], [0, 180])
+        #hist_s = cv2.calcHist([hsv], [1], None, [255], [0, 255])
+        if show:
+            plt.plot(hist_h, 'b')
+            #plt.plot(hist_s, 'y')
+            plt.show()
+        return hist_h
+    
+    # 对直方图均值滤波，滤波器大小为2*win
+    def avg_hist(self, hist, win, show=True):
+        h_size = hist.shape[0]
+        hist_avg = np.zeros(hist.shape)
+        for cur in range(h_size):
+            left = (cur - win) % h_size
+            right = (cur + win) % h_size
+            if left < right:
+                hist_avg[cur] = np.sum(hist[left:right+1])# // (right+1-left)
+            else:
+                hist_avg[cur] = (np.sum(hist[0:right+1]) + np.sum(hist[left:h_size+1]))# // (h_size+1-left+right)
+        if show:
+            plt.plot(hist_avg, 'r')
+            plt.show()
+        return hist_avg
+    
+    def get_histpeaks(self, img, hist):
+        hue = img[:,:,0]
+        h_size = hist.shape[0]  #180
+        hist_rshift = np.zeros(hist.shape)
+        hist_lshift = np.zeros(hist.shape)
+
+        hist_rshift[1:h_size] = hist[0:h_size-1]
+        hist_rshift[0] = hist[h_size-1]
+        hist_lshift[0:h_size-1] = hist[1:h_size]
+        hist_lshift[h_size-1] = hist[0]
+
+        height = hue.shape[0]
+        width = hue.shape[1]
+        area = width * height
+        thresh_up = (3.0/4.0) * area
+        thresh_dn = (1.0/16.0) * area
+
+        peaks_flags = (hist > hist_lshift) & (hist > hist_rshift) & (hist > thresh_dn) & (hist <thresh_up)
+        return peaks_flags
+    
+    def mask_bypeaks_hue(self, img, peaks_flags, win):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hue,_,_ = cv2.split(hsv)
+        h_size = peaks_flags.shape[0]   #180
+        mask = np.zeros(hue.shape)
+
+
+        for flag in range(h_size):
+            if peaks_flags[flag]:
+                print('Peak->', flag)
+                left = (flag - win) % h_size
+                right = (flag + win) % h_size
+                print(left, right)
+                if left < right:
+                    mask = (hue > left) & (hue < right)
+                else:
+                    mask = (hue < right) | (hue > left)
+        mask = mask * 255
+        mask = np.array(mask, dtype=np.uint8)
+        return mask
+
+
     # GetFilesPath with the end with .jpg or .png
     def getFilesPath(self,path):
         filesname=[]
@@ -135,6 +209,13 @@ class MyDialog(wx.Panel):
             self.fileList=self.getFilesPath(dlg.GetPath())
             if self.fileList:
                 self.setImage(self.fileList[0])
+                #打印hue、avg直方图
+                first_img_path = self.rected_path(self.fileList[0])  
+                print(first_img_path)
+                img = self.cv2_imread(first_img_path)
+                hist = self.show_hist(img)
+                self.avg_hist(hist, 10)
+                
                 self.gauge.SetValue((self.count+1)/len(self.fileList)*100)
                 self.pathText.Clear()
                 self.pathText.AppendText(dlg.GetPath())
@@ -143,14 +224,33 @@ class MyDialog(wx.Panel):
         dlg.Destroy()
 
 
-    # Save Picture button function
-    def save(self,event):
-        if self.cut_img is None:
+    # 显示hue阈值mask后的图片
+    def get_mask(self,event):
+        img_path = self.rected_path(self.fileList[self.count])
+        img = self.cv2_imread(img_path)
+        hist = self.show_hist(img, show=False)
+        hist_avg = self.avg_hist(hist, 10, show=False)
+        peaks_flags = self.get_histpeaks(img, hist_avg)
+        
+        size = peaks_flags.shape[0]
+        for pos in range(size):
+            if peaks_flags[pos]:
+                one_flag = np.zeros(peaks_flags.shape)
+                one_flag[pos, 0] = 1
+                mask = self.mask_bypeaks_hue(img, one_flag, 10)
+                cv2.namedWindow('mask', cv2.WINDOW_NORMAL)
+                cv2.imshow("mask", mask)
+                cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        '''
+                if self.cut_img is None:
             print("Please Draw Area")
             return
         else:
             cv2.imwrite(self.picNameList[self.count]+'_rect.jpg',self.cut_img)
             print("Save Successful")
+        '''
+
             
 
 
@@ -165,6 +265,11 @@ class MyDialog(wx.Panel):
             else:
                 self.setImage(self.fileList[self.count])
                 self.gauge.SetValue((self.count+1)/len(self.fileList)*100)
+                #打印hue直方图
+                first_img_path = self.rected_path(self.fileList[self.count])     
+                img = self.cv2_imread(first_img_path)
+                hist = self.show_hist(img)
+                self.avg_hist(hist, 10)
                 #print(self.count,self.fileList[self.count])
             
         else:
@@ -183,6 +288,12 @@ class MyDialog(wx.Panel):
             else:
                 self.setImage(self.fileList[self.count])
                 self.gauge.SetValue((self.count+1)/len(self.fileList)*100)
+                #打印hue直方图
+                first_img_path = self.rected_path(self.fileList[self.count])   
+                print(first_img_path)
+                img = self.cv2_imread(first_img_path)
+                hist = self.show_hist(img)
+                self.avg_hist(hist, 10)
                 #print(self.count,self.fileList[self.count])
 
         else:
